@@ -1,0 +1,113 @@
+name: Deploy - PRD - Manual
+
+on:
+    workflow_dispatch:
+        inputs:
+            list_sse_names:
+                description: "Insira os nomes das SSEs a serem enviadas, separados por espaços."
+                type: string
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+
+        if: github.ref == 'refs/heads/master'
+
+        env:
+            NODE_OPTIONS: --max_old_space_size=8000
+
+        steps:
+            - uses: actions/checkout@v3
+              with:
+                  fetch-depth: 2
+
+            - uses: actions/setup-node@v3
+              with:
+                  node-version: 20
+
+            - name: Install jq
+              run: sudo apt-get install jq
+
+            - name: Identify if build is required
+              id: check_build_required
+              run: |
+                  build_required=false
+                  for folder in ${{ github.event.inputs.list_sse_names }}; do
+                    if [ -f "$folder/package.json" ] && jq -e '.scripts.build' "$folder/package.json" > /dev/null; then
+                      build_required=true
+                      break
+                    fi
+                  done
+                  echo "build_required=$build_required" >> $GITHUB_ENV
+
+            - name: Install dependencies and remove specific modules
+              run: |
+                  for folder in ${{ github.event.inputs.list_sse_names }}; do
+                   cd $folder
+                   npm install
+                   ignoreConflict=$(jq -r '.ignoreConflict // "false"' package.json)
+                   if [ "$ignoreConflict" != "true" ]; then
+                     modules_to_remove=("winston" "express" "nconf" "https-proxy-agent")
+                     for module in "${modules_to_remove[@]}"; do
+                       module_path="node_modules/$module"
+                       if [ -d "$module_path" ]; then
+                         rm -rf "$module_path"
+                         echo "O módulo $module foi removido de $folder."
+                       else
+                         echo "O módulo $module não está instalado em $folder."
+                       fi
+                     done
+                   fi
+                   cd ..
+                   done
+
+            - name: DELETE NCONF
+              run: |
+                  for folder in ${{ github.event.inputs.list_sse_names }}; do
+                  cd $folder
+                    modules_to_remove=("nconf")
+                    for module in "${modules_to_remove[@]}"; do
+                      module_path="node_modules/$module"
+                      if [ -d "$module_path" ]; then
+                        rm -rf "$module_path"
+                        echo "O módulo $module foi removido de $folder."
+                      else
+                        echo "O módulo $module não está instalado em $folder."
+                      fi
+                    done
+                  cd ..
+                  done
+
+            - name: Build application if required
+              if: env.build_required == 'true'
+              run: |
+                  echo "Buildando aplicação"
+                  for folder in ${{ github.event.inputs.list_sse_names }}; do
+                    cd $folder
+                    npm run build
+                    cd ..
+                  done
+
+            - name: Zip changed folders
+              run: |
+                  for folder in ${{ github.event.inputs.list_sse_names }}; do
+                    cd $folder
+                    zip -r "../${folder}.zip" ./*
+                    cd ..
+                  done
+
+            - name: Authenticate with OCC and Upload to Server Extensions
+              env:
+                  OCC_ENDPOINT: ${{ secrets.OCC_PRD_ENDPOINT }}
+                  OCC_API_TOKEN: ${{ secrets.OCC_PRD_API_TOKEN }}
+              run: |
+                  OCC_ACCESS_TOKEN=$(curl -X POST -H "Authorization: Bearer $OCC_API_TOKEN" -d "grant_type=client_credentials" "$OCC_ENDPOINT/ccadmin/v1/login/" | jq -r '.access_token')
+                  echo "OCC Access Token: $OCC_ACCESS_TOKEN"
+                  echo "Mandando zip code"
+
+                  for folder in ${{ github.event.inputs.list_sse_names }}; do
+                    zip_file="${folder}.zip"
+                    echo "Enviando $zip_file para $OCC_ENDPOINT/ccadmin/v1/serverExtensions"
+                    curl -X POST -H "Authorization: Bearer $OCC_ACCESS_TOKEN" -F "fileUpload=@${GITHUB_WORKSPACE}/${zip_file}" -F "filename=${zip_file}" -F "force=true" -F "uploadType=extensions" "$OCC_ENDPOINT/ccadmin/v1/serverExtensions"
+                    sleep 120
+                  done
